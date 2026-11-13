@@ -1,0 +1,8 @@
+# 内核补丁/脚本必须保持 LF，避免 Windows 签出时变成 CRLF 导致编译失败
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

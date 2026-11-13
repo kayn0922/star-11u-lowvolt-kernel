@@ -1,0 +1,231 @@
+name: Build 11u low-voltage kernel
+
+# Xiaomi Mi 11 Ultra (star) / venus-5.10bpf base
+#  - emergency power-off voltage: 3400 mV -> 2980 mV
+#  - rebuildable voltage -> battery percentage table
+#  - output: AnyKernel3 flashable zip + raw Image.gz
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '上游分支名或 commit SHA（建议固定为 SHA 以保证可复现）'
+        required: true
+        default: 'venus-5.10bpf'
+        type: string
+      shutdown_mv:
+        description: '关机电压 mV（原厂 3400，默认 2980）'
+        required: true
+        default: '2980'
+        type: string
+      volt_soc_table:
+        description: '电压-电量表 mV:百分比,...（留空用 config/volt_soc_table.default.txt）'
+        required: false
+        default: ''
+        type: string
+      clang_url:
+        description: '可选：预编译 Clang tarball URL（留空用 apt clang-14）'
+        required: false
+        default: ''
+        type: string
+      llvm_ias:
+        description: 'LLVM_IAS：1=clang 集成汇编器，0=GNU as（需交叉 binutils）'
+        required: true
+        default: '1'
+        type: choice
+        options: ['1', '0']
+      jobs:
+        description: '编译并行数'
+        required: false
+        default: '4'
+        type: string
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+    paths:
+      - '.github/workflows/build-11u-lowvolt.yml'
+      - 'patches/**'
+      - 'overlay/**'
+      - 'config/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-11u-lowvolt-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      UPSTREAM: https://github.com/ikun-1145141/android_kernel_xiaomi_sm8350_star.git
+      KERNEL_DIR: ${{ github.workspace }}/kernel
+      OUT_DIR_NAME: out-star-5.4.302
+
+    steps:
+      - name: Checkout this build repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/lib/jvm /opt/hostedtoolcache/CodeQL || true
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
+            zlib1g-dev ccache zip unzip xz-utils zstd cpio kmod rsync \
+            python3 perl git curl ca-certificates file \
+            clang-14 lld-14 llvm-14 binutils-aarch64-linux-gnu
+
+      - name: Prepare Clang toolchain
+        env:
+          CLANG_URL: ${{ inputs.clang_url }}
+        run: |
+          set -euo pipefail
+          TC="$RUNNER_TEMP/tc"
+          mkdir -p "$TC/bin"
+          if [[ -n "${CLANG_URL:-}" ]]; then
+            curl -fL --retry 3 --connect-timeout 30 -o "$TC/clang.tar.gz" "$CLANG_URL"
+            mkdir -p "$TC/clang"
+            tar -xf "$TC/clang.tar.gz" -C "$TC/clang"
+            CLANG_BIN="$(find "$TC/clang" -type f -name clang -path '*/bin/*' -print -quit)"
+            if [[ -z "$CLANG_BIN" ]]; then
+              echo "ERROR: no */bin/clang in the downloaded toolchain" >&2
+              exit 1
+            fi
+            echo "$(dirname "$CLANG_BIN")" >> "$GITHUB_PATH"
+          else
+            for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
+                     llvm-objdump llvm-strip llvm-readelf llvm-as llvm-size; do
+              src="$(command -v "${t}-14" || true)"
+              if [[ -n "$src" ]]; then
+                ln -sf "$src" "$TC/bin/$t"
+              else
+                echo "note: ${t}-14 not provided by this image" >&2
+              fi
+            done
+            echo "$TC/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Show toolchain
+        run: |
+          clang --version 2>&1 | head -3 || true
+          ld.lld --version 2>&1 | head -2 || true
+          command -v clang ld.lld llvm-ar || true
+
+      - name: Fetch upstream kernel source
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'venus-5.10bpf' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$KERNEL_DIR"
+          cd "$KERNEL_DIR"
+          git init -q
+          git remote add origin "$UPSTREAM"
+          git fetch --depth 1 origin "$UPSTREAM_REF"
+          git checkout -q FETCH_HEAD
+          echo "upstream HEAD = $(git rev-parse HEAD)"
+          git submodule sync --recursive || true
+          if ! git submodule update --init --recursive --force --depth 1; then
+            git submodule deinit --all --force || true
+            git submodule update --init --recursive --force || true
+          fi
+          if [[ ! -f KernelSU/kernel/Kconfig ]]; then
+            echo "::warning::KernelSU submodule unavailable - KSU/SUSFS options will be dropped by olddefconfig"
+          fi
+
+      - name: Apply low-voltage patches
+        env:
+          LOWVOLT_SHUTDOWN_MV: ${{ inputs.shutdown_mv || '2980' }}
+          LOWVOLT_VSOC_TABLE: ${{ inputs.volt_soc_table || '' }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/patches/apply_lowvolt.py" "$KERNEL_DIR"
+          cd "$KERNEL_DIR"
+          bash -n build_lowvolt.sh
+          grep -q 'star_volt_soc_apply' drivers/power/supply/qti_battery_charger.c
+          grep -q 'STAR_VOLT_SOC_CUTOFF\|STAR_VOLT_SOC_SHUTDOWN_MV' drivers/power/supply/star_volt_soc.h
+
+      - name: Build Image.gz
+        working-directory: kernel
+        env:
+          JOBS: ${{ inputs.jobs || '4' }}
+          LLVM_IAS: ${{ inputs.llvm_ias || '1' }}
+          CROSS_COMPILE: ${{ inputs.llvm_ias == '0' && 'aarch64-linux-gnu-' || '' }}
+        run: |
+          set -euo pipefail
+          export OUT_DIR="$PWD/$OUT_DIR_NAME"
+          ./build_lowvolt.sh
+          test -s "$OUT_DIR_NAME/arch/arm64/boot/Image.gz"
+          grep -q '^CONFIG_STAR_VOLT_SOC=y$' "$OUT_DIR_NAME/.config"
+          # A missing symbol here would already break vmlinux linking; warn only
+          # so an unusual toolchain cannot fail an otherwise good build.
+          grep -q 'star_volt_soc_apply' "$OUT_DIR_NAME/System.map" || \
+            echo "::warning::star_volt_soc_apply not found in System.map"
+          echo "kernel.release = $(cat "$OUT_DIR_NAME/include/config/kernel.release")"
+
+      - name: Package AnyKernel3 flashable zip
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          bash anykernel3/build.sh
+
+      - name: Collect deliverables
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$KERNEL_DIR/$OUT_DIR_NAME/arch/arm64/boot/Image.gz" artifacts/Image.gz
+          cp "$KERNEL_DIR/$OUT_DIR_NAME"/*.zip artifacts/
+          cp "$KERNEL_DIR/LOWVOLT_BUILD_INFO.txt" artifacts/
+          printf 'upstream commit: ' > artifacts/UPSTREAM_COMMIT.txt
+          git -C "$KERNEL_DIR" rev-parse HEAD >> artifacts/UPSTREAM_COMMIT.txt
+          ls -lh artifacts/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: star-11u-lowvolt-${{ github.run_number }}
+          path: artifacts/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body: |
+            Xiaomi Mi 11 Ultra (star) low-voltage kernel, built from
+            `ikun-1145141/android_kernel_xiaomi_sm8350_star` by GitHub Actions.
+
+            See `LOWVOLT_BUILD_INFO.txt` for the shutdown voltage and the
+            voltage-to-percentage table baked into this build.
+          generate_release_notes: true
+
+      - name: Write build summary
+        if: always()
+        env:
+          SHUTDOWN_MV: ${{ inputs.shutdown_mv || '2980' }}
+          VSOC_TABLE: ${{ inputs.volt_soc_table || '(default table)' }}
+        run: |
+          {
+            echo "## 11u 低电压内核构建"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 内核 | 5.4 QGKI / star (Mi 11 Ultra) |"
+            echo "| 关机电压 | ${SHUTDOWN_MV} mV（原厂 3400 mV） |"
+            echo "| 电压-电量表 | \`${VSOC_TABLE}\` |"
+            echo ""
+            echo "产物：\`Image.gz\` 与 AnyKernel3 刷入包（见 Artifacts）。"
+            echo ""
+            echo "> ⚠️ 2.98 V 低于常规锂电芯放电下限，过放可能永久损坏电池/触发保护板；"
+            echo "> 请自行承担风险，首次测试用 \`fastboot boot\`，并保留原版 boot.img。"
+          } >> "$GITHUB_STEP_SUMMARY"

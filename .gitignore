@@ -1,0 +1,14 @@
+# 本地调研时下载的 upstream 源码副本，不属于构建仓库
+research/
+__pycache__/
+*.pyc
+
+# 本地 PAT（tools/gh_build.py 会读取，绝不提交）
+.gh_token
+
+# Actions / 本地构建产生物
+kernel/
+out-star-*/
+artifacts/
+*.zip
+Image.gz
