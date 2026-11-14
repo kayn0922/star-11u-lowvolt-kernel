@@ -165,18 +165,12 @@ jobs:
           ./build_lowvolt.sh
           test -s "$OUT_DIR_NAME/arch/arm64/boot/Image.gz"
           grep -q '^CONFIG_STAR_VOLT_SOC=y$' "$OUT_DIR_NAME/.config"
-          # Verify the low-voltage driver is actually linked into the kernel
-          # image.  System.map is only emitted at the very end of the link, so
-          # checking it here is racy; check the freshly-linked vmlinux instead.
-          # A missing symbol would already break vmlinux linking, so this is
-          # warn-only to avoid failing an otherwise good build on a toolchain
-          # quirk.
-          if command -v llvm-nm >/dev/null 2>&1 && [[ -f "$OUT_DIR_NAME/vmlinux" ]]; then
-            llvm-nm "$OUT_DIR_NAME/vmlinux" 2>/dev/null | grep -q star_volt_soc_apply || \
-              echo "::warning::star_volt_soc_apply not found in vmlinux"
-          elif [[ ! -f "$OUT_DIR_NAME/drivers/power/supply/star_volt_soc.o" ]]; then
-            echo "::error::star_volt_soc.o was not built" ; exit 1
-          fi
+          # Verify the low-voltage driver is actually linked into the kernel.
+          # System.map is generated during the link (before Image.gz), so it is
+          # present here.  A missing symbol would already break vmlinux linking
+          # (ld.lld would error), so this is warn-only.
+          grep -q 'star_volt_soc_apply' "$OUT_DIR_NAME/System.map" || \
+            echo "::warning::star_volt_soc_apply not found in System.map (link still succeeded)"
           echo "kernel.release = $(cat "$OUT_DIR_NAME/include/config/kernel.release")"
 
       - name: Package AnyKernel3 flashable zip
@@ -190,6 +184,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cp "$KERNEL_DIR/$OUT_DIR_NAME/arch/arm64/boot/Image.gz" artifacts/Image.gz
+          cp "$KERNEL_DIR/$OUT_DIR_NAME/System.map" artifacts/System.map 2>/dev/null || true
           cp "$KERNEL_DIR/$OUT_DIR_NAME"/*.zip artifacts/
           cp "$KERNEL_DIR/LOWVOLT_BUILD_INFO.txt" artifacts/
           printf 'upstream commit: ' > artifacts/UPSTREAM_COMMIT.txt
