@@ -187,7 +187,8 @@ def publish(owner: str, repo: str, token: str, files) -> str:
     tree, _ = request("POST", f"{base}/git/trees", token, tree_body)
 
     commit_body = {
-        "message": "star/11u low-voltage kernel: voltage EMA filtering + shutdown debounce",
+        "message": "star/11u low-voltage kernel: fix Android 30s shutdown popup "
+                   "(force GOOD health above cutoff, time-gated EMA, decouple shutdown path)",
         "tree": tree["sha"],
     }
     if head_sha:

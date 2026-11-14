@@ -103,6 +103,7 @@ header = f'''/* SPDX-License-Identifier: GPL-2.0-only */
 #ifdef CONFIG_STAR_VOLT_SOC
 int star_volt_soc_apply(int raw_soc, int volt_uv, int status);
 int star_volt_soc_shutdown_mv(void);
+int star_volt_soc_hardcutoff_mv(void);
 bool star_volt_soc_should_shutdown(int raw_mv);
 #else
 static inline int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
@@ -112,6 +113,10 @@ static inline int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 static inline int star_volt_soc_shutdown_mv(void)
 {{
     return STAR_VOLT_SOC_SHUTDOWN_MV;
+}}
+static inline int star_volt_soc_hardcutoff_mv(void)
+{{
+    return 2900;
 }}
 static inline bool star_volt_soc_should_shutdown(int raw_mv)
 {{
@@ -197,6 +202,27 @@ sub(GEN,
 sub(GEN, DT_OLD, DT_NEW, "override qcom,shutdown-voltage from vendor dtb")
 sub(GEN, CHECK_OLD, CHECK_NEW, "use tunable shutdown voltage")
 
+# Android's BatteryService also force-shuts the phone down when the battery
+# power_supply reports a critical health (DEAD/UNKNOWN/...) - that is what
+# produces the "30 second shutdown countdown" popup.  Report GOOD health
+# whenever the (filtered) voltage is above the hard cutoff so userspace never
+# independently powers off; the kernel path (star_volt_soc_should_shutdown)
+# remains the sole authority at the real cutoff.
+GEN_HEALTH_OLD = '\tcase POWER_SUPPLY_PROP_TEMP:\n'
+GEN_HEALTH_NEW = (
+    '\tcase POWER_SUPPLY_PROP_HEALTH:\n'
+    '\t\tpval->intval = pst->prop[prop_id];\n'
+    '\t\tif (IS_ENABLED(CONFIG_STAR_VOLT_SOC)) {\n'
+    '\t\t\t(void)read_property_id(bcdev, pst, BATT_VOLT_NOW);\n'
+    '\t\t\tif ((int)READ_ONCE(pst->prop[BATT_VOLT_NOW]) >\n'
+    '\t\t\t    star_volt_soc_hardcutoff_mv() * 1000)\n'
+    '\t\t\t\tpval->intval = POWER_SUPPLY_HEALTH_GOOD;\n'
+    '\t\t}\n'
+    '\t\tbreak;\n\n'
+    '\tcase POWER_SUPPLY_PROP_TEMP:\n'
+)
+sub(GEN, GEN_HEALTH_OLD, GEN_HEALTH_NEW, "force GOOD health above hard cutoff")
+
 # --- venus driver (kept in sync for CONFIG_QTI_BATTERY_CHARGER_VENUS builds) ---
 VEN = SUPPLY / "qti_battery_charger_venus.c"
 sub(VEN, "#include <linux/workqueue.h>\n",
@@ -218,6 +244,7 @@ sub(VEN,
     "hook POWER_SUPPLY_PROP_CAPACITY")
 sub(VEN, DT_OLD, DT_NEW, "override qcom,shutdown-voltage from vendor dtb")
 sub(VEN, CHECK_OLD, CHECK_NEW, "use tunable shutdown voltage")
+sub(VEN, GEN_HEALTH_OLD, GEN_HEALTH_NEW, "force GOOD health above hard cutoff")
 
 # ---------------------------------------------------------------------------
 # 4. QG fuel gauge defaults (for defconfigs that enable QCOM_POWER_SUPPLY /
