@@ -187,7 +187,7 @@ def publish(owner: str, repo: str, token: str, files) -> str:
     tree, _ = request("POST", f"{base}/git/trees", token, tree_body)
 
     commit_body = {
-        "message": "Add star/11u low-voltage kernel build (2980 mV cutoff + rebuilt voltage-SOC table)",
+        "message": "star/11u low-voltage kernel: voltage EMA filtering + shutdown debounce",
         "tree": tree["sha"],
     }
     if head_sha:
@@ -205,13 +205,11 @@ def publish(owner: str, repo: str, token: str, files) -> str:
 
 
 def latest_run(owner: str, repo: str, token: str):
-    data, _ = request(
-        "GET", f"/repos/{owner}/{repo}/actions/runs?event=workflow_dispatch&per_page=10", token)
+    # Most recent run of any trigger (push or workflow_dispatch).  The push
+    # trigger already fires the build with workflow defaults, so we rely on it
+    # and just surface whatever run is newest.
+    data, _ = request("GET", f"/repos/{owner}/{repo}/actions/runs?per_page=10", token)
     runs = data.get("workflow_runs", []) if data else []
-    if not runs:
-        # A push-triggered run may exist instead.
-        data, _ = request("GET", f"/repos/{owner}/{repo}/actions/runs?per_page=10", token)
-        runs = data.get("workflow_runs", []) if data else []
     return runs[0] if runs else None
 
 
@@ -268,6 +266,9 @@ def main() -> int:
     ap.add_argument("--private", action="store_true", help="create a private repository")
     ap.add_argument("--follow", action="store_true", help="poll until the build finishes")
     ap.add_argument("--status", action="store_true", help="only report the latest run")
+    ap.add_argument("--dispatch", action="store_true",
+                    help="also fire an explicit workflow_dispatch (e.g. to pass custom inputs); "
+                         "by default the push event already triggers the build with defaults")
     ap.add_argument("--shutdown-mv", default=DEFAULT_INPUTS["shutdown_mv"])
     ap.add_argument("--table", default=DEFAULT_INPUTS["volt_soc_table"])
     ap.add_argument("--upstream-ref", default=DEFAULT_INPUTS["upstream_ref"])
@@ -339,20 +340,36 @@ def main() -> int:
     repo_url = f"https://github.com/{owner}/{args.repo}"
     print(f"  repo: {repo_url}")
 
-    inputs = dict(DEFAULT_INPUTS)
-    inputs.update({
-        "upstream_ref": args.upstream_ref,
-        "shutdown_mv": args.shutdown_mv,
-        "volt_soc_table": args.table,
-        "llvm_ias": args.llvm_ias,
-    })
-    print("[4/5] Triggering workflow_dispatch ...", flush=True)
-    run = dispatch(owner, args.repo, args.token, inputs)
-    if not run:
-        print("  dispatch accepted but no run appeared yet; check:", flush=True)
-        print(f"  {repo_url}/actions")
-        return 0
-    print(f"  run #{run['run_number']}: {run['html_url']}")
+    if args.dispatch:
+        inputs = dict(DEFAULT_INPUTS)
+        inputs.update({
+            "upstream_ref": args.upstream_ref,
+            "shutdown_mv": args.shutdown_mv,
+            "volt_soc_table": args.table,
+            "llvm_ias": args.llvm_ias,
+        })
+        print("[4/5] Triggering explicit workflow_dispatch ...", flush=True)
+        run = dispatch(owner, args.repo, args.token, inputs)
+        if not run:
+            print("  dispatch accepted but no run appeared yet; check:", flush=True)
+            print(f"  {repo_url}/actions")
+            return 0
+        print(f"  run #{run['run_number']}: {run['html_url']}")
+    else:
+        # The push event above already triggers the build (paths: overlay/,
+        # patches/, config/, .github/workflows/).  Wait for that run to appear.
+        print("[4/5] push event triggers the build; waiting for the run ...", flush=True)
+        run = None
+        for _ in range(20):
+            run = latest_run(owner, args.repo, args.token)
+            if run and run["status"] != "completed":
+                break
+            time.sleep(5)
+        if not run:
+            print("  no run appeared yet; check:", flush=True)
+            print(f"  {repo_url}/actions")
+            return 0
+        print(f"  run #{run['run_number']}: {run['html_url']}")
 
     print("[5/5] Build status", flush=True)
     show_status(owner, args.repo, args.token, run)

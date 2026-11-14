@@ -103,6 +103,7 @@ header = f'''/* SPDX-License-Identifier: GPL-2.0-only */
 #ifdef CONFIG_STAR_VOLT_SOC
 int star_volt_soc_apply(int raw_soc, int volt_uv, int status);
 int star_volt_soc_shutdown_mv(void);
+bool star_volt_soc_should_shutdown(int raw_mv);
 #else
 static inline int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 {{
@@ -111,6 +112,10 @@ static inline int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 static inline int star_volt_soc_shutdown_mv(void)
 {{
     return STAR_VOLT_SOC_SHUTDOWN_MV;
+}}
+static inline bool star_volt_soc_should_shutdown(int raw_mv)
+{{
+    return false;
 }}
 #endif
 #endif /* _STAR_VOLT_SOC_H */
@@ -165,12 +170,10 @@ CHECK_OLD = ('\tif (pst->prop[BATT_VOLT_NOW] / 1000 > bcdev->shutdown_volt_mv) {
              '\t\t\tbcdev->shutdown_volt_mv);\n'
              '\t\treturn;\n'
              '\t}\n')
-CHECK_NEW = ('\t/* star low-voltage: honour the tunable cutoff; ignore bogus 0 V reads. */\n'
-             '\tif (pst->prop[BATT_VOLT_NOW] / 1000 < 2000 ||\n'
-             '\t    pst->prop[BATT_VOLT_NOW] / 1000 > star_volt_soc_shutdown_mv()) {\n'
-             '\t\tpr_debug("Battery voltage %d mV outside shutdown range (cutoff %d mV)\\n",\n'
-             '\t\t\tpst->prop[BATT_VOLT_NOW] / 1000,\n'
-             '\t\t\tstar_volt_soc_shutdown_mv());\n'
+CHECK_NEW = ('\t/* star low-voltage: filter + debounce the voltage before power-off,\n'
+             '\t * so a momentary load sag cannot kill the phone above the real\n'
+             '\t * cutoff.  All knobs live in /sys/module/star_volt_soc/parameters. */\n'
+             '\tif (!star_volt_soc_should_shutdown(pst->prop[BATT_VOLT_NOW] / 1000)) {\n'
              '\t\treturn;\n'
              '\t}\n')
 

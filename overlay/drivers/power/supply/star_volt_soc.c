@@ -10,17 +10,32 @@
  * shuts the phone down whenever it sees capacity == 0.
  *
  * This file puts a rewritable voltage->SOC table in front of the power supply
- * property that Android actually reads, and provides one tunable shutdown
- * voltage used by the emergency power-off check.
+ * property that Android actually reads, and provides a robust emergency
+ * power-off check.
  *
- * Runtime interface (built-in parameters):
- *   /sys/module/star_volt_soc/parameters/table          (RW)
- *   /sys/module/star_volt_soc/parameters/shutdown_mv    (RW)
- *   /sys/module/star_volt_soc/parameters/enable         (RW)
- *   /sys/module/star_volt_soc/parameters/apply_below_mv (RW)
- *   /sys/module/star_volt_soc/parameters/min_soc        (RW)
- *   /sys/module/star_volt_soc/parameters/debug          (RW)
- *   /sys/module/star_volt_soc/parameters/status         (RO)
+ * Why filtering + debounce matter:
+ *   A lithium cell's *instantaneous* terminal voltage = OCV - I*R_internal.
+ *   Under load it sags well below the resting (OCV) voltage, so a momentary
+ *   spike of current can momentarily read below the cutoff even when the cell
+ *   is still healthy at, say, 3.3 V.  Keying the shutdown on the raw voltage
+ *   therefore killed the phone far above the real 2.98 V cutoff.  We instead
+ *   feed an EMA-filtered voltage and only power off once that filtered value
+ *   has stayed at/below the cutoff for a sustained period.  The displayed
+ *   percentage uses the same filtered voltage plus a second EMA, so it no
+ *   longer jumps around with load.
+ *
+ * Runtime interface (built-in parameters, all tunable live via sysfs):
+ *   /sys/module/star_volt_soc/parameters/table           (RW)
+ *   /sys/module/star_volt_soc/parameters/shutdown_mv     (RW, mV)
+ *   /sys/module/star_volt_soc/parameters/volt_ema_alpha  (RW, %)
+ *   /sys/module/star_volt_soc/parameters/soc_ema_alpha   (RW, %)
+ *   /sys/module/star_volt_soc/parameters/debounce_ms     (RW, ms)
+ *   /sys/module/star_volt_soc/parameters/hard_cutoff_mv  (RW, mV)
+ *   /sys/module/star_volt_soc/parameters/enable          (RW)
+ *   /sys/module/star_volt_soc/parameters/apply_below_mv  (RW)
+ *   /sys/module/star_volt_soc/parameters/min_soc         (RW)
+ *   /sys/module/star_volt_soc/parameters/debug           (RW)
+ *   /sys/module/star_volt_soc/parameters/status          (RO)
  */
 
 #include <linux/kernel.h>
@@ -29,12 +44,14 @@
 #include <linux/power_supply.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/jiffies.h>
+#include <linux/types.h>
 
 #include "star_volt_soc.h"
 
 #define VSOC_MAX_POINTS		32
 #define VSOC_STR_LEN		1024
-#define VSOC_STATUS_LEN		256
+#define VSOC_STATUS_LEN		320
 
 struct vsoc_point {
 	int mv;
@@ -57,6 +74,38 @@ module_param_named(shutdown_mv, vsoc_shutdown_mv, int, 0644);
 MODULE_PARM_DESC(shutdown_mv,
 	"Emergency power-off voltage in mV (default 2980). Effective immediately");
 
+/*
+ * Voltage EMA coefficient (percent applied per update).  Smaller = smoother and
+ * more resistant to load sag, but slower to react to genuine discharge.
+ */
+static int vsoc_volt_ema_alpha = 5;
+module_param_named(volt_ema_alpha, vsoc_volt_ema_alpha, int, 0644);
+MODULE_PARM_DESC(volt_ema_alpha, "Voltage EMA coefficient (%) - smaller = smoother");
+
+/* Second EMA on the SOC itself, for extra display smoothing. */
+static int vsoc_soc_ema_alpha = 4;
+module_param_named(soc_ema_alpha, vsoc_soc_ema_alpha, int, 0644);
+MODULE_PARM_DESC(soc_ema_alpha, "SOC EMA coefficient (%) - smaller = smoother");
+
+/*
+ * The filtered voltage must stay at/below the cutoff for this long before we
+ * actually power off.  This is what prevents a momentary load sag (which can
+ * momentarily read below 2.98 V at a 3.3 V cell) from killing the phone.
+ */
+static int vsoc_debounce_ms = 20000;
+module_param_named(debounce_ms, vsoc_debounce_ms, int, 0644);
+MODULE_PARM_DESC(debounce_ms,
+	"Sustained below-cutoff time required before power-off (ms)");
+
+/*
+ * If the RAW voltage is at or below this, the cell is genuinely depleted and
+ * we power off immediately (no debounce).  Kept safely below the cutoff.
+ */
+static int vsoc_hard_cutoff_mv = 2900;
+module_param_named(hard_cutoff_mv, vsoc_hard_cutoff_mv, int, 0644);
+MODULE_PARM_DESC(hard_cutoff_mv,
+	"Raw voltage <= this (mV) powers off immediately");
+
 /* 0 = rewrite the whole curve; e.g. 3600 = only rewrite below 3.6 V. */
 static int vsoc_apply_below_mv;
 module_param_named(apply_below_mv, vsoc_apply_below_mv, int, 0644);
@@ -73,10 +122,16 @@ static int vsoc_debug;
 module_param_named(debug, vsoc_debug, int, 0644);
 MODULE_PARM_DESC(debug, "1 = rate-limited debug log for every remap");
 
+/* ---- shared state (protected by vsoc_lock) ---- */
 static int vsoc_last_raw = -1;
 static int vsoc_last_volt_uv;
 static int vsoc_last_status = -1;
 static int vsoc_last_mapped = -1;
+static long vsoc_v_filt;          /* EMA of voltage, mV */
+static int  vsoc_v_init;
+static int  vsoc_soc_filt;        /* EMA of SOC, 0..100 */
+static int  vsoc_soc_init;
+static unsigned long vsoc_below_jiffies; /* when filtered first fell below cutoff */
 static DEFINE_SPINLOCK(vsoc_lock);
 
 static int vsoc_atoi(const char **pp)
@@ -155,23 +210,52 @@ static int vsoc_interpolate(const struct vsoc_point *pts, int n, int mv)
 	return pts[n - 1].soc;
 }
 
+/*
+ * Feed one raw voltage observation (mV) into the EMA and return the filtered
+ * value.  Called from both the SOC mapping path and the shutdown path, so the
+ * two stay consistent.
+ */
+static long vsoc_feed(int raw_mv)
+{
+	unsigned long flags;
+	long vf;
+
+	spin_lock_irqsave(&vsoc_lock, flags);
+	if (!vsoc_v_init) {
+		vsoc_v_filt = raw_mv;
+		vsoc_v_init = 1;
+	} else {
+		int a = clamp_val(vsoc_volt_ema_alpha, 1, 50);
+
+		vsoc_v_filt += (long)(raw_mv - vsoc_v_filt) * a / 100;
+	}
+	vf = vsoc_v_filt;
+	spin_unlock_irqrestore(&vsoc_lock, flags);
+	return vf;
+}
+
 static int vsoc_status_get(char *buf, const struct kernel_param *kp)
 {
 	unsigned long flags;
 	int raw, volt, status, mapped;
+	long vf;
 
 	spin_lock_irqsave(&vsoc_lock, flags);
 	raw = vsoc_last_raw;
 	volt = vsoc_last_volt_uv;
 	status = vsoc_last_status;
 	mapped = vsoc_last_mapped;
+	vf = vsoc_v_filt;
 	spin_unlock_irqrestore(&vsoc_lock, flags);
 
 	return scnprintf(buf, VSOC_STATUS_LEN,
-		"raw_soc=%d volt_uv=%d mapped_soc=%d status=%d "
-		"enable=%d shutdown_mv=%d table=%s\n",
-		raw, volt, mapped, status, vsoc_enable,
-		star_volt_soc_shutdown_mv(), vsoc_table);
+		"raw_soc=%d volt_uv=%d v_filt_mv=%ld mapped_soc=%d status=%d "
+		"enable=%d shutdown_mv=%d hard_cutoff_mv=%d debounce_ms=%d "
+		"volt_ema_alpha=%d soc_ema_alpha=%d table=%s\n",
+		raw, volt, vf, mapped, status, vsoc_enable,
+		star_volt_soc_shutdown_mv(), vsoc_hard_cutoff_mv,
+		vsoc_debounce_ms, vsoc_volt_ema_alpha, vsoc_soc_ema_alpha,
+		vsoc_table);
 }
 
 static int vsoc_status_set(const char *val, const struct kernel_param *kp)
@@ -191,17 +275,20 @@ module_param_cb(status, &vsoc_status_ops, NULL, 0444);
  * @volt_uv: current battery voltage in microvolts
  * @status:  POWER_SUPPLY_STATUS_* value
  *
- * Returns the SOC that must be handed to userspace.  While charging the
- * original gauge is left alone (voltage rises with the charger, so a
- * voltage-only curve would jump around).  Above the shutdown voltage a
- * minimum of vsoc_min_soc is kept so Android never sees 0%.
+ * Returns the SOC that must be handed to userspace.  The voltage used is the
+ * EMA-filtered value (so load sags do not make the percentage jump), and the
+ * resulting percentage is itself EMA-smoothed.  While charging the original
+ * gauge is left alone (voltage rises with the charger, so a voltage-only curve
+ * would jump around).  Above the shutdown voltage a minimum of vsoc_min_soc is
+ * kept so Android never sees 0%.
  */
 int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 {
 	struct vsoc_point pts[VSOC_MAX_POINTS];
 	char buf[VSOC_STR_LEN];
 	unsigned long flags;
-	int n, mv, soc;
+	int n, soc, target, sda;
+	long mv_f;
 
 	raw_soc = clamp_val(raw_soc, 0, 100);
 
@@ -211,25 +298,31 @@ int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 	vsoc_last_status = status;
 	spin_unlock_irqrestore(&vsoc_lock, flags);
 
-	if (!vsoc_enable || volt_uv <= 0) {
+	if (!vsoc_enable) {
 		soc = raw_soc;
 		goto out;
 	}
-	if (status == POWER_SUPPLY_STATUS_CHARGING ||
+
+	/* keep the EMA tracking in every state (incl. charging) */
+	if (volt_uv > 0)
+		mv_f = vsoc_feed(volt_uv / 1000);
+
+	if (volt_uv <= 0 ||
+	    status == POWER_SUPPLY_STATUS_CHARGING ||
 	    status == POWER_SUPPLY_STATUS_FULL) {
 		soc = raw_soc;
 		goto out;
 	}
 
-	mv = volt_uv / 1000;
-
-	/* Below the cutoff: show 0% and let battery_check_work power us off. */
-	if (mv <= star_volt_soc_shutdown_mv()) {
+	if (mv_f <= star_volt_soc_shutdown_mv()) {
+		/* filtered voltage at/below the real cutoff: expose 0% and let
+		 * star_volt_soc_should_shutdown() do the power-off.  Using the
+		 * filtered value means a momentary sag will not flip us to 0%. */
 		soc = 0;
 		goto out;
 	}
 
-	if (vsoc_apply_below_mv > 0 && mv > vsoc_apply_below_mv) {
+	if (vsoc_apply_below_mv > 0 && (volt_uv / 1000) > vsoc_apply_below_mv) {
 		soc = raw_soc;
 		goto out;
 	}
@@ -246,13 +339,25 @@ int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 		goto out;
 	}
 
-	soc = clamp_val(vsoc_interpolate(pts, n, mv), 0, 100);
-	if (soc < clamp_val(vsoc_min_soc, 0, 100))
-		soc = clamp_val(vsoc_min_soc, 0, 100);
+	target = clamp_val(vsoc_interpolate(pts, n, (int)mv_f), 0, 100);
+	if (target < clamp_val(vsoc_min_soc, 0, 100))
+		target = clamp_val(vsoc_min_soc, 0, 100);
+
+	/* second EMA on SOC so the displayed % does not jump with load */
+	sda = clamp_val(vsoc_soc_ema_alpha, 1, 50);
+	spin_lock_irqsave(&vsoc_lock, flags);
+	if (!vsoc_soc_init) {
+		vsoc_soc_filt = target;
+		vsoc_soc_init = 1;
+	} else {
+		vsoc_soc_filt += (target - vsoc_soc_filt) * sda / 100;
+	}
+	soc = vsoc_soc_filt;
+	spin_unlock_irqrestore(&vsoc_lock, flags);
 
 	if (vsoc_debug)
-		pr_info_ratelimited("star_volt_soc: %d uV -> %d%% (raw %d%%)\n",
-				    volt_uv, soc, raw_soc);
+		pr_info_ratelimited("star_volt_soc: %ld mV -> %d%% (raw %d%%)\n",
+				    mv_f, soc, raw_soc);
 
 out:
 	spin_lock_irqsave(&vsoc_lock, flags);
@@ -261,6 +366,46 @@ out:
 	return soc;
 }
 EXPORT_SYMBOL_GPL(star_volt_soc_apply);
+
+/**
+ * star_volt_soc_should_shutdown - decide whether to power the phone off
+ * @raw_mv: raw instantaneous battery voltage in mV
+ *
+ * Returns true only when the cell is genuinely at/below the cutoff: either the
+ * raw voltage is catastrophically low (<= hard_cutoff_mv), or the EMA-filtered
+ * voltage has stayed at/below the cutoff for at least debounce_ms.  This is
+ * what keeps a momentary load sag (which reads below 2.98 V at a healthy
+ * 3.3 V cell) from shutting the phone down.
+ */
+bool star_volt_soc_should_shutdown(int raw_mv)
+{
+	unsigned long flags, now = jiffies;
+	int sd = star_volt_soc_shutdown_mv();
+	long vf;
+	bool trip = false;
+
+	if (raw_mv < 2000)
+		return false;           /* bogus read */
+
+	vf = vsoc_feed(raw_mv);
+
+	spin_lock_irqsave(&vsoc_lock, flags);
+	if (raw_mv <= clamp_val(vsoc_hard_cutoff_mv, 2500, 3400)) {
+		trip = true;
+	} else if (vf <= sd) {
+		if (vsoc_below_jiffies == 0)
+			vsoc_below_jiffies = now;
+		if (time_after(now, vsoc_below_jiffies +
+			       msecs_to_jiffies(clamp_val(vsoc_debounce_ms,
+						       0, 600000))))
+			trip = true;
+	} else {
+		vsoc_below_jiffies = 0;
+	}
+	spin_unlock_irqrestore(&vsoc_lock, flags);
+	return trip;
+}
+EXPORT_SYMBOL_GPL(star_volt_soc_should_shutdown);
 
 int star_volt_soc_shutdown_mv(void)
 {

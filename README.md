@@ -118,15 +118,44 @@ git push -u origin main
 | --- | --- | --- |
 | `table` | 见上 | 整张电压-电量表，写入立即生效 |
 | `shutdown_mv` | `2980` | 紧急关机电压，**立即生效**（关机检查每次调用都读它） |
+| `volt_ema_alpha` | `5` | 电压 EMA 系数（%）—— 越小越平滑、越抗负载跌落；值越小，3.3 V 带载时越不容易被"误判"到 2.98 V |
+| `soc_ema_alpha` | `4` | 电量百分比的二次 EMA 系数（%）—— 越小，百分比跳动越小 |
+| `debounce_ms` | `20000` | 滤波后电压需**持续低于**关机阈值这么久才真正关机（毫秒）。这是防止"负载瞬间跌落→瞬时电压 < 2.98 V→误关机"的关键 |
+| `hard_cutoff_mv` | `2900` | 原始电压 ≤ 此值视为真没电，**立即**关机，不做防抖（安全底线，低于 `shutdown_mv`） |
 | `enable` | `1` | 是否启用电压→电量重映射 |
 | `apply_below_mv` | `0` | 只在此电压以下重映射（如填 `3600` 只改低压区，高压区沿用原电量计），`0` = 全区间 |
 | `min_soc` | `1` | 电压高于关机点时允许显示的最小百分比 |
 | `debug` | `0` | 打开限速调试日志 |
-| `status` | 只读 | 查看 `raw_soc / volt_uv / mapped_soc / status / shutdown_mv / table` |
+| `status` | 只读 | 查看 `raw_soc / volt_uv / v_filt_mv / mapped_soc / shutdown_mv / debounce_ms / …` |
 
 充电中（`CHARGING` / `FULL`）不套用电压表，直接用原电量计数值，因为充电时电压被拉高、纯电压曲线会跳变。
 
-> 纯电压估 SOC 的固有缺陷：大负载/低温下电压会瞬时下陷，百分比可能跟着跳。若只关心 3.4 V 以下的表现，建议把 `apply_below_mv` 设成 `3600`，其余区间保持原厂电量计。
+> **为什么之前 3.3 V 还会关机 / 放电会跳电？**
+> 关机判定原来直接读**瞬时电压**：电池在 3.3 V 静置时，一旦带负载，端电压 = 开路电压 − 电流×内阻，会瞬间跌到 2.98 V 以下，于是立刻 `kernel_power_off()`。也就是说它"以为"到了 2.98 V，其实 3.4 V 没关、3.3 V 关，正好对应负载跌落幅度。放电"跳电/跳百分比"也是同一原因：瞬时电压随负载上下跳，百分比跟着跳。
+>
+> 本版的做法：关机判定改用 **EMA 滤波后的电压**，并且要求它**持续低于阈值 `debounce_ms` 才关机**；电量百分比同样基于滤波电压并再做一次 EMA 平滑。这样 3.3 V 带载的瞬时跌落不会再触发关机，百分比也不会乱跳。
+
+### 现场调参（刷一次后不用重编即可试）
+
+```bash
+# 1) 看当前状态（滤波电压、映射百分比、各参数）
+adb shell su -c 'cat /sys/module/star_volt_soc/parameters/status'
+
+# 2) 如果 3.3 V 仍被关机：把电压滤波调更"迟钝"、防抖更长
+adb shell su -c 'echo 3  > /sys/module/star_volt_soc/parameters/volt_ema_alpha'   # 更平滑
+adb shell su -c 'echo 30000 > /sys/module/star_volt_soc/parameters/debounce_ms'   # 持续 30s 才关
+
+# 3) 如果百分比仍跳：把 SOC 滤波调更平滑
+adb shell su -c 'echo 2 > /sys/module/star_volt_soc/parameters/soc_ema_alpha'
+
+# 4) 想真把关机点再压低一点（如 2.95 V）：
+adb shell su -c 'echo 2950 > /sys/module/star_volt_soc/parameters/shutdown_mv'
+
+# 5) 想临时恢复原厂曲线（关机电压仍是 2.98 V）：
+adb shell su -c 'echo 0 > /sys/module/star_volt_soc/parameters/enable'
+```
+
+> 调参只是运行时生效，重启后回到编译期默认值。想固化，改 `config/volt_soc_table.default.txt` 或直接重跑 Actions（Workflow 有对应输入项）。
 
 ---
 
