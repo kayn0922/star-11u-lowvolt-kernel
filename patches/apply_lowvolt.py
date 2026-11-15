@@ -105,6 +105,7 @@ int star_volt_soc_apply(int raw_soc, int volt_uv, int status);
 int star_volt_soc_shutdown_mv(void);
 int star_volt_soc_hardcutoff_mv(void);
 bool star_volt_soc_should_shutdown(int raw_mv);
+int star_volt_soc_report_volt_uv(int raw_uv, int status);
 #else
 static inline int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 {{
@@ -121,6 +122,10 @@ static inline int star_volt_soc_hardcutoff_mv(void)
 static inline bool star_volt_soc_should_shutdown(int raw_mv)
 {{
     return false;
+}}
+static inline int star_volt_soc_report_volt_uv(int raw_uv, int status)
+{{
+    return raw_uv;
 }}
 #endif
 #endif /* _STAR_VOLT_SOC_H */
@@ -223,6 +228,27 @@ GEN_HEALTH_NEW = (
 )
 sub(GEN, GEN_HEALTH_OLD, GEN_HEALTH_NEW, "force GOOD health above hard cutoff")
 
+# Some MIUI/HyperOS builds key the "battery low, N seconds" countdown off the
+# reported voltage.  Clamp the voltage shown to userspace up to a safe floor
+# while discharging; the kernel shutdown path still uses the real voltage.
+GEN_VOLT_OLD = ('\tcase POWER_SUPPLY_PROP_TEMP:\n')
+GEN_VOLT_NEW = (
+    '\tcase POWER_SUPPLY_PROP_VOLTAGE_NOW:\n'
+    '\tcase POWER_SUPPLY_PROP_VOLTAGE_OCV:\n'
+    '\t\tpval->intval = pst->prop[prop_id];\n'
+    '\t\tif (IS_ENABLED(CONFIG_STAR_VOLT_SOC)) {\n'
+    '\t\t\tint vsoc_st = (int)READ_ONCE(pst->prop[BATT_STATUS]);\n'
+    '\t\t\tif (vsoc_st == POWER_SUPPLY_STATUS_UNKNOWN)\n'
+    '\t\t\t\t(void)read_property_id(bcdev, pst, BATT_STATUS);\n'
+    '\t\t\tpval->intval = star_volt_soc_report_volt_uv(\n'
+    '\t\t\t\tpval->intval,\n'
+    '\t\t\t\t(int)READ_ONCE(pst->prop[BATT_STATUS]));\n'
+    '\t\t}\n'
+    '\t\tbreak;\n\n'
+    '\tcase POWER_SUPPLY_PROP_TEMP:\n'
+)
+sub(GEN, GEN_VOLT_OLD, GEN_VOLT_NEW, "clamp reported voltage to floor")
+
 # --- venus driver (kept in sync for CONFIG_QTI_BATTERY_CHARGER_VENUS builds) ---
 VEN = SUPPLY / "qti_battery_charger_venus.c"
 sub(VEN, "#include <linux/workqueue.h>\n",
@@ -245,6 +271,7 @@ sub(VEN,
 sub(VEN, DT_OLD, DT_NEW, "override qcom,shutdown-voltage from vendor dtb")
 sub(VEN, CHECK_OLD, CHECK_NEW, "use tunable shutdown voltage")
 sub(VEN, GEN_HEALTH_OLD, GEN_HEALTH_NEW, "force GOOD health above hard cutoff")
+sub(VEN, GEN_VOLT_OLD, GEN_VOLT_NEW, "clamp reported voltage to floor")
 
 # ---------------------------------------------------------------------------
 # 4. QG fuel gauge defaults (for defconfigs that enable QCOM_POWER_SUPPLY /

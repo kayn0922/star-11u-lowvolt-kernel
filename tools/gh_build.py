@@ -39,7 +39,7 @@ WORKFLOW = "build-11u-lowvolt.yml"
 BRANCH = "main"
 
 # Directories/files that must never be uploaded to the build repo.
-SKIP_DIRS = {".git", "research", "__pycache__", "artifacts", "kernel", ".github"}
+SKIP_DIRS = {".git", "research", "__pycache__", "artifacts", "kernel", ".github", "release"}
 SKIP_DIR_PREFIXES = ("out-star-",)
 SKIP_SUFFIXES = (".pyc", ".zip", ".gz", ".tar", ".xz", ".pem", ".key")
 SKIP_NAMES = {
@@ -187,8 +187,8 @@ def publish(owner: str, repo: str, token: str, files) -> str:
     tree, _ = request("POST", f"{base}/git/trees", token, tree_body)
 
     commit_body = {
-        "message": "star/11u low-voltage kernel: fix Android 30s shutdown popup "
-                   "(force GOOD health above cutoff, time-gated EMA, decouple shutdown path)",
+        "message": "star/11u low-voltage kernel: raise low-V SOC above MIUI shutdown "
+                   "threshold + clamp reported voltage floor",
         "tree": tree["sha"],
     }
     if head_sha:

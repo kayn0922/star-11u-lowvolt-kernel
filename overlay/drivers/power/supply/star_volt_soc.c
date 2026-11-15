@@ -34,6 +34,7 @@
  *   /sys/module/star_volt_soc/parameters/enable          (RW)
  *   /sys/module/star_volt_soc/parameters/apply_below_mv  (RW)
  *   /sys/module/star_volt_soc/parameters/min_soc         (RW)
+ *   /sys/module/star_volt_soc/parameters/report_floor_mv (RW)
  *   /sys/module/star_volt_soc/parameters/debug           (RW)
  *   /sys/module/star_volt_soc/parameters/status          (RO)
  */
@@ -125,7 +126,20 @@ MODULE_PARM_DESC(apply_below_mv,
 static int vsoc_min_soc = 5;
 module_param_named(min_soc, vsoc_min_soc, int, 0644);
 MODULE_PARM_DESC(min_soc,
-	"Minimum reported SOC while voltage is above shutdown_mv (default 1)");
+	"Minimum reported SOC while voltage is above shutdown_mv (default 5)");
+
+/*
+ * Some MIUI/HyperOS builds trigger the "battery low, shutting down in N
+ * seconds" countdown off the *voltage* the framework reads, not (only) the
+ * percentage.  When non-zero, reported voltage is clamped up to this floor while
+ * discharging and above the hard cutoff, so the framework never sees a
+ * "critical" voltage reading.  This affects ONLY the value reported to userspace -
+ * the kernel power-off path always uses the real voltage.  0 disables it.
+ */
+static int vsoc_report_floor_mv = 3600;
+module_param_named(report_floor_mv, vsoc_report_floor_mv, int, 0644);
+MODULE_PARM_DESC(report_floor_mv,
+	"Fake voltage floor reported to Android while discharging (mV, 0=off)");
 
 static int vsoc_debug;
 module_param_named(debug, vsoc_debug, int, 0644);
@@ -261,11 +275,11 @@ static int vsoc_status_get(char *buf, const struct kernel_param *kp)
 	return scnprintf(buf, VSOC_STATUS_LEN,
 		"raw_soc=%d volt_uv=%d v_filt_mv=%ld mapped_soc=%d status=%d "
 		"enable=%d shutdown_mv=%d hard_cutoff_mv=%d debounce_ms=%d "
-		"volt_ema_alpha=%d soc_ema_alpha=%d table=%s\n",
+		"volt_ema_alpha=%d soc_ema_alpha=%d report_floor_mv=%d table=%s\n",
 		raw, volt, vf, mapped, status, vsoc_enable,
 		star_volt_soc_shutdown_mv(), vsoc_hard_cutoff_mv,
 		vsoc_debounce_ms, vsoc_volt_ema_alpha, vsoc_soc_ema_alpha,
-		vsoc_table);
+		vsoc_report_floor_mv, vsoc_table);
 }
 
 static int vsoc_status_set(const char *val, const struct kernel_param *kp)
@@ -444,6 +458,35 @@ int star_volt_soc_hardcutoff_mv(void)
 	return clamp_val(vsoc_hard_cutoff_mv, 2500, 3400);
 }
 EXPORT_SYMBOL_GPL(star_volt_soc_hardcutoff_mv);
+
+/**
+ * star_volt_soc_report_volt_uv - voltage shown to Android's framework
+ * @raw_uv: real instantaneous battery voltage in microvolts
+ * @status: POWER_SUPPLY_STATUS_* value
+ *
+ * Some MIUI/HyperOS builds key the "battery low, shutting down in N seconds"
+ * countdown off the reported voltage.  While discharging and above the hard
+ * cutoff, clamp the reported voltage up to report_floor_mv so the framework
+ * never sees a value it considers critical.  This affects ONLY what userspace
+ * reads: the shutdown path (star_volt_soc_should_shutdown) uses the real
+ * voltage, so safety is unchanged.  Charging is never tampered with.
+ */
+int star_volt_soc_report_volt_uv(int raw_uv, int status)
+{
+	int floor_mv = clamp_val(vsoc_report_floor_mv, 0, 4200);
+
+	if (!vsoc_enable || floor_mv <= 0 || raw_uv <= 0)
+		return raw_uv;
+	if (status == POWER_SUPPLY_STATUS_CHARGING ||
+	    status == POWER_SUPPLY_STATUS_FULL)
+		return raw_uv;
+	if ((raw_uv / 1000) <= star_volt_soc_hardcutoff_mv())
+		return raw_uv;              /* really depleted: show the truth */
+	if ((raw_uv / 1000) < floor_mv)
+		return floor_mv * 1000;
+	return raw_uv;
+}
+EXPORT_SYMBOL_GPL(star_volt_soc_report_volt_uv);
 
 MODULE_AUTHOR("star low-voltage kernel build");
 MODULE_DESCRIPTION("Rebuildable voltage -> battery SOC table for Xiaomi 11 Ultra");
