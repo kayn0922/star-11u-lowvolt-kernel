@@ -92,10 +92,18 @@ static int vsoc_volt_ema_alpha = 5;
 module_param_named(volt_ema_alpha, vsoc_volt_ema_alpha, int, 0644);
 MODULE_PARM_DESC(volt_ema_alpha, "Voltage EMA coefficient (%) - smaller = smoother");
 
-/* Second EMA on the SOC itself, for extra display smoothing. */
-static int vsoc_soc_ema_alpha = 4;
+/*
+ * Second EMA on the SOC itself.  Kept MILD by default (50, i.e. clamp max):
+ * the voltage EMA above already does the heavy anti-jump smoothing, so an SOC
+ * EMA this fast is enough to follow the real voltage without oversmoothing.
+ * A very small value (e.g. 4) made the displayed % crawl toward its target only
+ * a couple of samples per read and visibly freeze half-way (observed: stuck
+ * at 44 instead of the correct 39), because Android stops reading capacity
+ * once it looks stable.  Smaller = smoother display but slower to follow.
+ */
+static int vsoc_soc_ema_alpha = 50;
 module_param_named(soc_ema_alpha, vsoc_soc_ema_alpha, int, 0644);
-MODULE_PARM_DESC(soc_ema_alpha, "SOC EMA coefficient (%) - smaller = smoother");
+MODULE_PARM_DESC(soc_ema_alpha, "SOC EMA coefficient (%) - smaller = smoother, slower to follow");
 
 /*
  * The filtered voltage must stay at/below the cutoff for this long before we
@@ -129,14 +137,20 @@ MODULE_PARM_DESC(min_soc,
 	"Minimum reported SOC while voltage is above shutdown_mv (default 5)");
 
 /*
- * Some MIUI/HyperOS builds trigger the "battery low, shutting down in N
- * seconds" countdown off the *voltage* the framework reads, not (only) the
- * percentage.  When non-zero, reported voltage is clamped up to this floor while
- * discharging and above the hard cutoff, so the framework never sees a
- * "critical" voltage reading.  This affects ONLY the value reported to userspace -
- * the kernel power-off path always uses the real voltage.  0 disables it.
+ * Opt-in voltage-report floor.  DISABLED by default (0).
+ *
+ * Why off by default: clamping the reported voltage to a constant value
+ * freezes Android's battery-changed broadcast.  BatteryService only sends
+ * ACTION_BATTERY_CHANGED when a tracked value actually changes, so a pinned
+ * voltage makes the whole battery UI (including the displayed level %) stop
+ * updating -- the phone then appears stuck at one percentage for hours while
+ * the real voltage keeps dropping.  The low-battery shutdown countdown is
+ * driven by the *percentage*, which the rebuilt table already keeps well above
+ * the MIUI threshold (3.4 V -> 29%), so this clamp is not needed in practice.
+ * Kept as an opt-in knob for builds that genuinely key on voltage, but leave
+ * it off unless you have confirmed you need it.
  */
-static int vsoc_report_floor_mv = 3600;
+static int vsoc_report_floor_mv = 0;
 module_param_named(report_floor_mv, vsoc_report_floor_mv, int, 0644);
 MODULE_PARM_DESC(report_floor_mv,
 	"Fake voltage floor reported to Android while discharging (mV, 0=off)");
