@@ -60,8 +60,13 @@
  * the instantaneous (noisy) voltage and defeat the whole point of smoothing.
  * We only accept a fresh sample every VSOC_SAMPLE_MS; in between, the last
  * computed percentage is returned unchanged.
+ *
+ * 500 ms (instead of 1000 ms) makes the displayed % advance in smaller, more
+ * frequent steps, so a slow discharge no longer looks like a staircase.  The
+ * EMA coefficient is a per-sample ratio, so halving the interval simply gives
+ * twice as many (half-sized) steps; the smoothing strength is unchanged.
  */
-#define VSOC_SAMPLE_MS		1000
+#define VSOC_SAMPLE_MS		500
 
 struct vsoc_point {
 	int mv;
@@ -100,6 +105,7 @@ MODULE_PARM_DESC(volt_ema_alpha, "Voltage EMA coefficient (%) - smaller = smooth
  * a couple of samples per read and visibly freeze half-way (observed: stuck
  * at 44 instead of the correct 39), because Android stops reading capacity
  * once it looks stable.  Smaller = smoother display but slower to follow.
+ * Range 1..100; at 100 the SOC tracks the table target immediately.
  */
 static int vsoc_soc_ema_alpha = 50;
 module_param_named(soc_ema_alpha, vsoc_soc_ema_alpha, int, 0644);
@@ -166,7 +172,15 @@ static int vsoc_last_status = -1;
 static int vsoc_last_mapped = -1;
 static long vsoc_v_filt;          /* EMA of voltage, mV */
 static int  vsoc_v_init;
-static int  vsoc_soc_filt;        /* EMA of SOC, 0..100 */
+/*
+ * SOC EMA is stored as fixed-point, scaled by VSOC_FP (100).  A plain integer
+ * EMA stalls when the remaining gap is small: (gap=1)*alpha/100 truncates to 0,
+ * so the value froze 1% short of its target and only jumped once the target
+ * moved >=2% away -> "staircase" discharging.  Keeping 2 decimal places means
+ * every sample advances a little, giving a smooth, continuous decline.
+ */
+#define VSOC_FP  100
+static int  vsoc_soc_filt;        /* EMA of SOC, fixed-point 0..100*VSOC_FP */
 static int  vsoc_soc_init;
 static unsigned long vsoc_below_jiffies; /* when filtered first fell below cutoff */
 static unsigned long vsoc_last_sample_jiffies; /* EMA sample throttle */
@@ -383,16 +397,19 @@ int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 				target = clamp_val(
 					vsoc_interpolate(pts, n, (int)mv_f),
 					0, 100);
-				sda = clamp_val(vsoc_soc_ema_alpha, 1, 50);
+				sda = clamp_val(vsoc_soc_ema_alpha, 1, 100);
 				spin_lock_irqsave(&vsoc_lock, flags);
 				if (!vsoc_soc_init) {
-					vsoc_soc_filt = target;
+					vsoc_soc_filt = target * VSOC_FP;
 					vsoc_soc_init = 1;
 				} else {
-					vsoc_soc_filt += (target - vsoc_soc_filt) *
+					int goal = target * VSOC_FP;
+
+					vsoc_soc_filt += (goal - vsoc_soc_filt) *
 							 sda / 100;
 				}
-				soc = vsoc_soc_filt;
+				/* round to nearest integer percentage for userspace */
+				soc = (vsoc_soc_filt + VSOC_FP / 2) / VSOC_FP;
 				spin_unlock_irqrestore(&vsoc_lock, flags);
 			}
 		}
