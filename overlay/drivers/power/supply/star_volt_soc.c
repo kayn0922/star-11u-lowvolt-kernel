@@ -38,6 +38,7 @@
  *   /sys/module/star_volt_soc/parameters/report_knee_mv  (RW, mV)
  *   /sys/module/star_volt_soc/parameters/report_ratio    (RW, %)
  *   /sys/module/star_volt_soc/parameters/report_floor_mv (RW)
+ *   /sys/module/star_volt_soc/parameters/cc_scale        (RW)
  *   /sys/module/star_volt_soc/parameters/debug           (RW)
  *   /sys/module/star_volt_soc/parameters/status          (RO)
  */
@@ -55,7 +56,7 @@
 
 #define VSOC_MAX_POINTS		32
 #define VSOC_STR_LEN		1024
-#define VSOC_STATUS_LEN		512
+#define VSOC_STATUS_LEN		768
 
 /*
  * EMA sampling interval.  get_property() is called many times per second by
@@ -223,6 +224,28 @@ module_param_named(report_floor_mv, vsoc_report_floor_mv, int, 0644);
 MODULE_PARM_DESC(report_floor_mv,
 	"Fake voltage floor reported to Android while discharging (mV, 0=off)");
 
+/*
+ * Rescale POWER_SUPPLY_PROP_CHARGE_COUNTER to match the remapped percentage.
+ *
+ * This is the last consumer that could disagree with `capacity`.  On a phone
+ * whose gauge has drifted, the raw counter can say 5% while the voltage table
+ * says 70%; anything that derives its own SOC from charge_counter/charge_full
+ * (MIUI/HyperOS security center does its own mAh maths) then still believes the
+ * battery is nearly empty and pops the "shutting down in N seconds" countdown
+ * long before the real 2.98 V cutoff.
+ *
+ * With cc_scale=1 (default) the counter is reported as
+ *     charge_full * mapped_soc / 100
+ * so every value the battery node exposes (capacity, charge_counter, voltage)
+ * tells the same story.  charge_full itself is left untouched, so the ratio
+ * stays consistent.  The real counter is never modified in hardware; set
+ * cc_scale=0 to pass it through unchanged.
+ */
+static int vsoc_cc_scale = 1;
+module_param_named(cc_scale, vsoc_cc_scale, int, 0644);
+MODULE_PARM_DESC(cc_scale,
+	"1 = report charge_counter rescaled to the mapped percentage (default)");
+
 static int vsoc_debug;
 module_param_named(debug, vsoc_debug, int, 0644);
 MODULE_PARM_DESC(debug, "1 = rate-limited debug log for every remap");
@@ -232,6 +255,9 @@ static int vsoc_last_raw = -1;
 static int vsoc_last_volt_uv;
 static int vsoc_last_status = -1;
 static int vsoc_last_mapped = -1;
+static int vsoc_last_cc_in = -1;   /* raw coulomb counter, uAh */
+static int vsoc_last_cc_out = -1;  /* counter as reported to userspace, uAh */
+static int vsoc_last_cc_full = -1; /* learned charge_full used for scaling */
 static long vsoc_v_filt;          /* EMA of voltage, mV */
 static int  vsoc_v_init;
 /*
@@ -352,6 +378,7 @@ static int vsoc_status_get(char *buf, const struct kernel_param *kp)
 {
 	unsigned long flags;
 	int raw, volt, status, mapped;
+	int cc_in, cc_out, cc_full;
 	long vf;
 
 	spin_lock_irqsave(&vsoc_lock, flags);
@@ -359,6 +386,9 @@ static int vsoc_status_get(char *buf, const struct kernel_param *kp)
 	volt = vsoc_last_volt_uv;
 	status = vsoc_last_status;
 	mapped = vsoc_last_mapped;
+	cc_in = vsoc_last_cc_in;
+	cc_out = vsoc_last_cc_out;
+	cc_full = vsoc_last_cc_full;
 	vf = vsoc_v_filt;
 	spin_unlock_irqrestore(&vsoc_lock, flags);
 
@@ -366,12 +396,14 @@ static int vsoc_status_get(char *buf, const struct kernel_param *kp)
 		"raw_soc=%d volt_uv=%d v_filt_mv=%ld mapped_soc=%d status=%d "
 		"enable=%d shutdown_mv=%d hard_cutoff_mv=%d debounce_ms=%d "
 		"volt_ema_alpha=%d soc_ema_alpha=%d soc_rise_alpha=%d "
-		"report_knee_mv=%d report_ratio=%d report_floor_mv=%d table=%s\n",
+		"report_knee_mv=%d report_ratio=%d report_floor_mv=%d "
+		"cc_scale=%d cc_in=%d cc_out=%d cc_full=%d table=%s\n",
 		raw, volt, vf, mapped, status, vsoc_enable,
 		star_volt_soc_shutdown_mv(), vsoc_hard_cutoff_mv,
 		vsoc_debounce_ms, vsoc_volt_ema_alpha, vsoc_soc_ema_alpha,
 		vsoc_soc_rise_alpha, vsoc_report_knee_mv, vsoc_report_ratio,
-		vsoc_report_floor_mv, vsoc_table);
+		vsoc_report_floor_mv, vsoc_cc_scale, cc_in, cc_out, cc_full,
+		vsoc_table);
 }
 
 static int vsoc_status_set(const char *val, const struct kernel_param *kp)
@@ -662,6 +694,61 @@ int star_volt_soc_report_volt_uv(int raw_uv, int status)
 	return out_mv * 1000;
 }
 EXPORT_SYMBOL_GPL(star_volt_soc_report_volt_uv);
+
+/**
+ * star_volt_soc_scale_cc - coulomb counter consistent with the mapped SOC
+ * @raw_uah:  raw CHARGE_COUNTER from the fuel gauge, uAh
+ * @full_uah: learned CHARGE_FULL for the same pack, uAh (<= 0 if unknown)
+ *
+ * Returns charge_full * mapped_soc / 100, i.e. a remaining capacity that
+ * agrees with the percentage we report through POWER_SUPPLY_PROP_CAPACITY.
+ *
+ * Why this matters: the gauge on this phone has drifted, so its own counter can
+ * read ~5% while the voltage table says 70%.  Android's framework is happy (it
+ * only looks at capacity), but HyperOS security center does its own mAh maths
+ * from charge_counter and concludes the battery is nearly empty - which is what
+ * keeps popping the low-battery countdown regardless of the percentage we
+ * report.  Making the counter agree removes that last disagreement.
+ *
+ * The hardware counter is never written; only the value handed to userspace
+ * changes.  Returns @raw_uah unchanged when scaling is disabled, when the
+ * mapped percentage is not known yet, or when @full_uah is unusable.
+ */
+int star_volt_soc_scale_cc(int raw_uah, int full_uah)
+{
+	unsigned long flags;
+	long long out;
+	int mapped;
+
+	if (!vsoc_enable || !vsoc_cc_scale)
+		return raw_uah;
+	if (raw_uah <= 0 || full_uah <= 0)
+		return raw_uah;
+
+	spin_lock_irqsave(&vsoc_lock, flags);
+	mapped = vsoc_last_mapped;
+	if (mapped >= 0 && mapped <= 100) {
+		vsoc_last_cc_in = raw_uah;
+		vsoc_last_cc_full = full_uah;
+	}
+	spin_unlock_irqrestore(&vsoc_lock, flags);
+
+	if (mapped < 0 || mapped > 100)
+		return raw_uah;         /* no mapping yet: keep the real counter */
+
+	out = (long long)full_uah * mapped / 100;
+	if (out < 0)
+		return raw_uah;
+	if (out > 2000000000LL)
+		out = 2000000000LL;
+
+	spin_lock_irqsave(&vsoc_lock, flags);
+	vsoc_last_cc_out = (int)out;
+	spin_unlock_irqrestore(&vsoc_lock, flags);
+
+	return (int)out;
+}
+EXPORT_SYMBOL_GPL(star_volt_soc_scale_cc);
 
 MODULE_AUTHOR("star low-voltage kernel build");
 MODULE_DESCRIPTION("Rebuildable voltage -> battery SOC table for Xiaomi 11 Ultra");

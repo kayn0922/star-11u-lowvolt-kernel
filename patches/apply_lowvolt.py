@@ -106,6 +106,7 @@ int star_volt_soc_shutdown_mv(void);
 int star_volt_soc_hardcutoff_mv(void);
 bool star_volt_soc_should_shutdown(int raw_mv);
 int star_volt_soc_report_volt_uv(int raw_uv, int status);
+int star_volt_soc_scale_cc(int raw_uah, int full_uah);
 #else
 static inline int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 {{
@@ -126,6 +127,10 @@ static inline bool star_volt_soc_should_shutdown(int raw_mv)
 static inline int star_volt_soc_report_volt_uv(int raw_uv, int status)
 {{
     return raw_uv;
+}}
+static inline int star_volt_soc_scale_cc(int raw_uah, int full_uah)
+{{
+    return raw_uah;
 }}
 #endif
 #endif /* _STAR_VOLT_SOC_H */
@@ -249,6 +254,33 @@ GEN_VOLT_NEW = (
 )
 sub(GEN, GEN_VOLT_OLD, GEN_VOLT_NEW, "clamp reported voltage to floor")
 
+# The gauge's coulomb counter is the last value that can disagree with the
+# percentage we report.  On a drifted pack it can read ~5% while the voltage
+# table says 70%; MIUI/HyperOS security center does its own mAh maths from
+# charge_counter, concludes "nearly empty" and keeps popping the low-battery
+# countdown no matter what capacity says.  Report charge_full * mapped / 100
+# instead so every field on the battery node agrees.
+CC_OLD = ('\tdefault:\n'
+          '\t\tpval->intval = pst->prop[prop_id];\n'
+          '\t\tbreak;\n'
+          '\t}\n')
+CC_NEW = ('\tcase POWER_SUPPLY_PROP_CHARGE_COUNTER:\n'
+          '\t\tpval->intval = pst->prop[prop_id];\n'
+          '\t\tif (IS_ENABLED(CONFIG_STAR_VOLT_SOC)) {\n'
+          '\t\t\tint cc_full = 0;\n'
+          '\n'
+          '\t\t\tif (read_property_id(bcdev, pst, BATT_CHG_FULL) >= 0)\n'
+          '\t\t\t\tcc_full = (int)READ_ONCE(pst->prop[BATT_CHG_FULL]);\n'
+          '\t\t\tpval->intval = star_volt_soc_scale_cc(pval->intval,\n'
+          '\t\t\t\t\t\t\t      cc_full);\n'
+          '\t\t}\n'
+          '\t\tbreak;\n'
+          '\tdefault:\n'
+          '\t\tpval->intval = pst->prop[prop_id];\n'
+          '\t\tbreak;\n'
+          '\t}\n')
+sub(GEN, CC_OLD, CC_NEW, "scale charge_counter to mapped SOC")
+
 # --- venus driver (kept in sync for CONFIG_QTI_BATTERY_CHARGER_VENUS builds) ---
 VEN = SUPPLY / "qti_battery_charger_venus.c"
 sub(VEN, "#include <linux/workqueue.h>\n",
@@ -272,6 +304,29 @@ sub(VEN, DT_OLD, DT_NEW, "override qcom,shutdown-voltage from vendor dtb")
 sub(VEN, CHECK_OLD, CHECK_NEW, "use tunable shutdown voltage")
 sub(VEN, GEN_HEALTH_OLD, GEN_HEALTH_NEW, "force GOOD health above hard cutoff")
 sub(VEN, GEN_VOLT_OLD, GEN_VOLT_NEW, "clamp reported voltage to floor")
+
+# venus serves CHARGE_COUNTER from its own early-return branch (it reads the
+# remaining-uAh straight from the fuel gauge), so it needs its own hook.
+VEN_CC_OLD = ('\tif (prop == POWER_SUPPLY_PROP_CHARGE_COUNTER &&\n'
+              '\t    READ_ONCE(bcdev->battery_expanded) &&\n'
+              '\t    !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah)) {\n'
+              '\t\tpval->intval = remaining_uah;\n'
+              '\t\treturn 0;\n'
+              '\t}\n')
+VEN_CC_NEW = ('\tif (prop == POWER_SUPPLY_PROP_CHARGE_COUNTER &&\n'
+              '\t    READ_ONCE(bcdev->battery_expanded) &&\n'
+              '\t    !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah)) {\n'
+              '\t\tpval->intval = remaining_uah;\n'
+              '\t\tif (IS_ENABLED(CONFIG_STAR_VOLT_SOC)) {\n'
+              '\t\t\tbattery_chg_refresh_pack_capacity_uah(bcdev, pst,\n'
+              '\t\t\t\t\t\t\t     &learned_full_uah);\n'
+              '\t\t\tpval->intval = star_volt_soc_scale_cc(pval->intval,\n'
+              '\t\t\t\t\t\t\t      (int)learned_full_uah);\n'
+              '\t\t}\n'
+              '\t\treturn 0;\n'
+              '\t}\n')
+sub(VEN, VEN_CC_OLD, VEN_CC_NEW, "scale charge_counter (venus early path)")
+sub(VEN, CC_OLD, CC_NEW, "scale charge_counter to mapped SOC")
 
 # ---------------------------------------------------------------------------
 # 4. QG fuel gauge defaults (for defconfigs that enable QCOM_POWER_SUPPLY /
