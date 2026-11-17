@@ -34,6 +34,9 @@
  *   /sys/module/star_volt_soc/parameters/enable          (RW)
  *   /sys/module/star_volt_soc/parameters/apply_below_mv  (RW)
  *   /sys/module/star_volt_soc/parameters/min_soc         (RW)
+ *   /sys/module/star_volt_soc/parameters/soc_rise_alpha  (RW, %)
+ *   /sys/module/star_volt_soc/parameters/report_knee_mv  (RW, mV)
+ *   /sys/module/star_volt_soc/parameters/report_ratio    (RW, %)
  *   /sys/module/star_volt_soc/parameters/report_floor_mv (RW)
  *   /sys/module/star_volt_soc/parameters/debug           (RW)
  *   /sys/module/star_volt_soc/parameters/status          (RO)
@@ -52,7 +55,7 @@
 
 #define VSOC_MAX_POINTS		32
 #define VSOC_STR_LEN		1024
-#define VSOC_STATUS_LEN		320
+#define VSOC_STATUS_LEN		512
 
 /*
  * EMA sampling interval.  get_property() is called many times per second by
@@ -92,8 +95,16 @@ MODULE_PARM_DESC(shutdown_mv,
 /*
  * Voltage EMA coefficient (percent applied per update).  Smaller = smoother and
  * more resistant to load sag, but slower to react to genuine discharge.
+ *
+ * At the 500 ms sampling interval, alpha 3 gives a time constant of roughly
+ * 17 s.  That is what actually kills the "percentage jumps when a heavy app
+ * starts / a charger is unplugged" symptom: a 200 mV load sag lasting a few
+ * seconds is attenuated to a few tens of mV before it ever reaches the table.
+ * A genuine discharge moves slowly enough that the lag is irrelevant, and the
+ * power-off decision does not use this filter at all (it uses the raw voltage
+ * with a debounce), so smoothing here costs no safety.
  */
-static int vsoc_volt_ema_alpha = 5;
+static int vsoc_volt_ema_alpha = 3;
 module_param_named(volt_ema_alpha, vsoc_volt_ema_alpha, int, 0644);
 MODULE_PARM_DESC(volt_ema_alpha, "Voltage EMA coefficient (%) - smaller = smoother");
 
@@ -110,6 +121,29 @@ MODULE_PARM_DESC(volt_ema_alpha, "Voltage EMA coefficient (%) - smaller = smooth
 static int vsoc_soc_ema_alpha = 50;
 module_param_named(soc_ema_alpha, vsoc_soc_ema_alpha, int, 0644);
 MODULE_PARM_DESC(soc_ema_alpha, "SOC EMA coefficient (%) - smaller = smoother, slower to follow");
+
+/*
+ * Asymmetric EMA for UPWARD corrections only.  Discharging should only ever
+ * move the percentage down, but two things push it up:
+ *
+ *   1. load removal - the terminal voltage springs back by 100-300 mV and the
+ *      table immediately maps that to a higher percentage;
+ *   2. the charge->discharge handover - while charging we report the raw gauge
+ *      value, and on unplug we switch to the table.  If the gauge only reached
+ *      83% while the table says 100% at 4.4 V, the switch used to teleport the
+ *      display from 83% to 100% within a couple of samples (observed: "full
+ *      charge shows 80-something, then a few minutes after unplugging it jumps
+ *      to 100%").
+ *
+ * Using a small alpha for increases turns those jumps into a short, smooth
+ * ramp (alpha 8 at 500 ms: 83% -> 100% in roughly 20 s, instead of teleporting
+ * there in two samples).  Decreases keep using soc_ema_alpha above, so normal
+ * discharge is unaffected.  Range 1..100.
+ */
+static int vsoc_soc_rise_alpha = 8;
+module_param_named(soc_rise_alpha, vsoc_soc_rise_alpha, int, 0644);
+MODULE_PARM_DESC(soc_rise_alpha,
+	"SOC EMA coefficient for UPWARD moves only (%) - smaller = no sudden jumps up");
 
 /*
  * The filtered voltage must stay at/below the cutoff for this long before we
@@ -143,18 +177,46 @@ MODULE_PARM_DESC(min_soc,
 	"Minimum reported SOC while voltage is above shutdown_mv (default 5)");
 
 /*
- * Opt-in voltage-report floor.  DISABLED by default (0).
+ * Reported-voltage compression (the fix for the "shutting down in N seconds"
+ * reminder that HyperOS raises at ~3.4 V).
  *
- * Why off by default: clamping the reported voltage to a constant value
- * freezes Android's battery-changed broadcast.  BatteryService only sends
- * ACTION_BATTERY_CHANGED when a tracked value actually changes, so a pinned
- * voltage makes the whole battery UI (including the displayed level %) stop
- * updating -- the phone then appears stuck at one percentage for hours while
- * the real voltage keeps dropping.  The low-battery shutdown countdown is
- * driven by the *percentage*, which the rebuilt table already keeps well above
- * the MIUI threshold (3.4 V -> 29%), so this clamp is not needed in practice.
- * Kept as an opt-in knob for builds that genuinely key on voltage, but leave
- * it off unless you have confirmed you need it.
+ * Field evidence: with the hard floor OFF, the countdown came back at 3.4 V
+ * even though the rebuilt table reports 29% there.  With the floor ON (v7,
+ * voltage pinned at 3.6 V) the countdown did not appear.  So HyperOS is keying
+ * on the *voltage*, not the percentage.
+ *
+ * Pinning the voltage is not an option though: a constant value stops the
+ * battery-changed broadcast and freezes the whole battery UI.  Instead we
+ * COMPRESS the low end of the curve.  Below report_knee_mv we report
+ *
+ *	reported = knee - (knee - raw) * report_ratio / 100
+ *
+ * i.e. only report_ratio % of the drop is visible.  With the defaults
+ * (knee 3900 mV, ratio 20): raw 3900 -> 3900, 3.4 V -> 3800, 3.3 V -> 3780,
+ * 2.98 V -> 3716.  The reported value keeps moving monotonically, so broadcasts
+ * still fire and the percentage keeps updating, but the framework never sees a
+ * value anywhere near its 3.4 V warning threshold.
+ *
+ * This affects ONLY the value reported to userspace.  The power-off path
+ * (star_volt_soc_should_shutdown) always uses the real voltage, so safety is
+ * unchanged.  Charging is never tampered with.  Set report_knee_mv=0 to disable.
+ */
+static int vsoc_report_knee_mv = 3900;
+module_param_named(report_knee_mv, vsoc_report_knee_mv, int, 0644);
+MODULE_PARM_DESC(report_knee_mv,
+	"Compress reported voltage below this knee (mV, 0 = off, default 3900)");
+
+/* How much of the drop below the knee stays visible (%, default 20). */
+static int vsoc_report_ratio = 20;
+module_param_named(report_ratio, vsoc_report_ratio, int, 0644);
+MODULE_PARM_DESC(report_ratio,
+	"Percent of the sub-knee voltage drop reported to userspace (default 20)");
+
+/*
+ * Optional hard floor, applied after the compression above.  DISABLED by
+ * default (0): a *constant* floor pins the voltage, which freezes Android's
+ * battery-changed broadcast (the whole battery UI stops updating).  Prefer
+ * report_knee_mv/report_ratio; this is only a last-resort knob.
  */
 static int vsoc_report_floor_mv = 0;
 module_param_named(report_floor_mv, vsoc_report_floor_mv, int, 0644);
@@ -303,10 +365,12 @@ static int vsoc_status_get(char *buf, const struct kernel_param *kp)
 	return scnprintf(buf, VSOC_STATUS_LEN,
 		"raw_soc=%d volt_uv=%d v_filt_mv=%ld mapped_soc=%d status=%d "
 		"enable=%d shutdown_mv=%d hard_cutoff_mv=%d debounce_ms=%d "
-		"volt_ema_alpha=%d soc_ema_alpha=%d report_floor_mv=%d table=%s\n",
+		"volt_ema_alpha=%d soc_ema_alpha=%d soc_rise_alpha=%d "
+		"report_knee_mv=%d report_ratio=%d report_floor_mv=%d table=%s\n",
 		raw, volt, vf, mapped, status, vsoc_enable,
 		star_volt_soc_shutdown_mv(), vsoc_hard_cutoff_mv,
 		vsoc_debounce_ms, vsoc_volt_ema_alpha, vsoc_soc_ema_alpha,
+		vsoc_soc_rise_alpha, vsoc_report_knee_mv, vsoc_report_ratio,
 		vsoc_report_floor_mv, vsoc_table);
 }
 
@@ -347,17 +411,30 @@ int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 	struct vsoc_point pts[VSOC_MAX_POINTS];
 	char buf[VSOC_STR_LEN];
 	unsigned long flags, now = jiffies;
-	int n = 0, soc = 0, target = 0, sda = 0;
+	int n = 0, soc = 0, target = 0, sda = 0, prev_status;
 	long mv_f = 0;
-	bool sampled = false;
+	bool sampled = false, status_changed;
 
 	raw_soc = clamp_val(raw_soc, 0, 100);
 
 	spin_lock_irqsave(&vsoc_lock, flags);
+	prev_status = vsoc_last_status;
 	vsoc_last_raw = raw_soc;
 	vsoc_last_volt_uv = volt_uv;
 	vsoc_last_status = status;
 	spin_unlock_irqrestore(&vsoc_lock, flags);
+
+	/*
+	 * Only a crossing between "on charger" and "on battery" needs a re-seed.
+	 * The QTI driver flips between DISCHARGING and NOT_CHARGING while on
+	 * battery, and treating that as a transition would re-seed the filter on
+	 * every sample and freeze the percentage.
+	 */
+	status_changed =
+		((status == POWER_SUPPLY_STATUS_CHARGING ||
+		  status == POWER_SUPPLY_STATUS_FULL) !=
+		 (prev_status == POWER_SUPPLY_STATUS_CHARGING ||
+		  prev_status == POWER_SUPPLY_STATUS_FULL));
 
 	if (!vsoc_enable)
 		return raw_soc;
@@ -369,8 +446,23 @@ int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 		vsoc_last_sample_jiffies = now;
 		sampled = true;
 
-		if (status == POWER_SUPPLY_STATUS_CHARGING ||
-		    status == POWER_SUPPLY_STATUS_FULL) {
+		if (status == POWER_SUPPLY_STATUS_FULL) {
+			/*
+			 * Charge complete.  Report 100%: the raw gauge often tops
+			 * out well below 100 (observed 83%) even though the cell
+			 * is genuinely full at ~4.4 V, which used to leave the
+			 * status bar showing "80-something %" on a full battery
+			 * and then teleporting to 100% after unplugging.
+			 */
+			soc = 100;
+		} else if (status == POWER_SUPPLY_STATUS_CHARGING) {
+			/*
+			 * While charging, the terminal voltage is dominated by the
+			 * charge current (CC phase sits at 4.3-4.4 V from ~50%),
+			 * so the table would over-read badly.  Use the gauge's own
+			 * percentage; the handover to the table on unplug is made
+			 * continuous by the seeding + rise limit below.
+			 */
 			soc = raw_soc;
 		} else if (mv_f <= star_volt_soc_shutdown_mv()) {
 			/*
@@ -399,14 +491,40 @@ int star_volt_soc_apply(int raw_soc, int volt_uv, int status)
 					0, 100);
 				sda = clamp_val(vsoc_soc_ema_alpha, 1, 100);
 				spin_lock_irqsave(&vsoc_lock, flags);
-				if (!vsoc_soc_init) {
-					vsoc_soc_filt = target * VSOC_FP;
+				if (!vsoc_soc_init || status_changed) {
+					/*
+					 * First sample, or we just switched between
+					 * charging and discharging.  Seed from the
+					 * value the user is currently looking at so
+					 * the handover is continuous: without this,
+					 * the stale filter (never updated while
+					 * charging) walked to the new target in a
+					 * couple of samples, which is what made the
+					 * display look like it jumped to 100%.
+					 */
+					int seed = vsoc_last_mapped;
+
+					if (seed < 0)
+						seed = target;
+					vsoc_soc_filt =
+						clamp_val(seed, 0, 100) * VSOC_FP;
 					vsoc_soc_init = 1;
 				} else {
 					int goal = target * VSOC_FP;
+					/*
+					 * Asymmetric: falls follow soc_ema_alpha
+					 * (fast, so the normal discharge curve is
+					 * not delayed), rises follow the much
+					 * smaller soc_rise_alpha so a load-release
+					 * rebound or a charge/discharge handover
+					 * becomes a short ramp instead of a jump.
+					 */
+					int a = (goal > vsoc_soc_filt) ?
+						clamp_val(vsoc_soc_rise_alpha,
+							  1, 100) : sda;
 
 					vsoc_soc_filt += (goal - vsoc_soc_filt) *
-							 sda / 100;
+							 a / 100;
 				}
 				/* round to nearest integer percentage for userspace */
 				soc = (vsoc_soc_filt + VSOC_FP / 2) / VSOC_FP;
@@ -495,27 +613,53 @@ EXPORT_SYMBOL_GPL(star_volt_soc_hardcutoff_mv);
  * @raw_uv: real instantaneous battery voltage in microvolts
  * @status: POWER_SUPPLY_STATUS_* value
  *
- * Some MIUI/HyperOS builds key the "battery low, shutting down in N seconds"
- * countdown off the reported voltage.  While discharging and above the hard
- * cutoff, clamp the reported voltage up to report_floor_mv so the framework
- * never sees a value it considers critical.  This affects ONLY what userspace
- * reads: the shutdown path (star_volt_soc_should_shutdown) uses the real
- * voltage, so safety is unchanged.  Charging is never tampered with.
+ * HyperOS raises its "battery low, shutting down in N seconds" countdown off
+ * the reported *voltage* (confirmed in the field: it fires at 3.4 V even when
+ * the percentage there is 29%, and stops firing when the voltage was pinned at
+ * 3.6 V).  So the low end of the reported curve is compressed instead of
+ * clamped:
+ *
+ *	reported = knee - (knee - raw) * ratio / 100     (raw < knee)
+ *
+ * The reported value stays monotonic with the real voltage, so Android keeps
+ * seeing changes and the battery UI keeps refreshing, while the framework never
+ * sees anything close to its warning threshold.  Defaults (knee 3900, ratio 20)
+ * report 3.4 V as 3800 mV and the 2.98 V cutoff as 3716 mV.
+ *
+ * This affects ONLY what userspace reads: the shutdown path
+ * (star_volt_soc_should_shutdown) uses the real voltage, so safety is
+ * unchanged.  Charging is never tampered with, and once the cell is genuinely
+ * depleted (<= hard_cutoff_mv) the true voltage is passed through so the UI can
+ * still show a real "about to die" reading.
  */
 int star_volt_soc_report_volt_uv(int raw_uv, int status)
 {
-	int floor_mv = clamp_val(vsoc_report_floor_mv, 0, 4200);
+	int raw_mv, out_mv, knee, ratio, floor_mv;
 
-	if (!vsoc_enable || floor_mv <= 0 || raw_uv <= 0)
+	if (!vsoc_enable || raw_uv <= 0)
 		return raw_uv;
 	if (status == POWER_SUPPLY_STATUS_CHARGING ||
 	    status == POWER_SUPPLY_STATUS_FULL)
 		return raw_uv;
-	if ((raw_uv / 1000) <= star_volt_soc_hardcutoff_mv())
+
+	raw_mv = raw_uv / 1000;
+	if (raw_mv <= star_volt_soc_hardcutoff_mv())
 		return raw_uv;              /* really depleted: show the truth */
-	if ((raw_uv / 1000) < floor_mv)
-		return floor_mv * 1000;
-	return raw_uv;
+
+	out_mv = raw_mv;
+	knee = clamp_val(vsoc_report_knee_mv, 0, 4400);
+	ratio = clamp_val(vsoc_report_ratio, 0, 100);
+	if (knee > 0 && raw_mv < knee)
+		out_mv = knee - (knee - raw_mv) * ratio / 100;
+
+	floor_mv = clamp_val(vsoc_report_floor_mv, 0, 4200);
+	if (floor_mv > 0 && out_mv < floor_mv)
+		out_mv = floor_mv;
+
+	if (out_mv > 4200)
+		out_mv = 4200;
+
+	return out_mv * 1000;
 }
 EXPORT_SYMBOL_GPL(star_volt_soc_report_volt_uv);
 
